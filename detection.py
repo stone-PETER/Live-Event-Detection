@@ -22,12 +22,18 @@ CATEGORIES_PATH = os.path.join(MODEL_DIR, 'categories.json')
 SAMPLE_RATE = 44100
 WINDOW_SIZE = 1024  # ~23ms at 44.1kHz
 HOP_LENGTH = 512   # ~12ms at 44.1kHz
-BUFFER_DURATION = 2  # seconds for each analysis window
-DETECTION_THRESHOLD = 0.85  # Increased from 0.7 to reduce false positives
+BUFFER_DURATION = 5  # seconds for each analysis window
+DETECTION_THRESHOLD = 0.70  # Temporary lower threshold for testing
+AMBULANCE_THRESHOLD = 0.80  # Temporary lower threshold for testing
+MIN_CONSISTENT_PREDICTIONS = 2  # Require fewer consistent detections for testing
+PREDICTION_HISTORY_SIZE = 6  # Number of predictions to keep in history
+COOLDOWN_PERIOD = 2.0  # Seconds between detections
+BACKGROUND_NOISE_SAMPLES = []  # To store background noise profiles
+CLASS_CONFUSION_MATRIX = {}  # Track which classes are confused with each other
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='.', static_url_path='')
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
 
 # Global variables
 audio_buffer = queue.Queue()
@@ -36,11 +42,9 @@ detection_thread = None
 model = None
 categories = {}
 audio_stream = None  # Keep a reference to the audio stream
-
-# Add these global variables after your existing ones
 recent_predictions = []
-PREDICTION_HISTORY_SIZE = 3  # Number of recent predictions to consider
-MIN_CONSISTENT_PREDICTIONS = 2  # Minimum number of consistent predictions required
+class_thresholds = {}  # Will store custom thresholds for each class
+DEFAULT_THRESHOLD = 0.90  # Base threshold for all classes
 
 def load_trained_model():
     """Load the trained model and categories"""
@@ -109,15 +113,23 @@ def detect_events():
     samples_collected = 0
     
     last_detection_time = time.time()
-    cooldown_period = 1.0  # seconds between detections to avoid rapid repeats
+    last_detected_class = None
+    
+    # Initialize recent predictions as an empty list
+    recent_predictions = []
     
     print("Starting audio event detection...")
+    
+    # Create a reverse mapping from event name to class index
+    event_to_class = {v: int(k) for k, v in categories.items()}
+    ambulance_class = event_to_class.get('ambulance', -1)
     
     while not stop_recording.is_set():
         try:
             # Get data from the buffer queue
-            if not audio_buffer.empty():
-                new_data = audio_buffer.get()
+            try:
+                # Non-blocking get with timeout
+                new_data = audio_buffer.get(timeout=0.5)
                 
                 # Add to our running buffer
                 data_length = min(len(new_data), buffer_samples - samples_collected)
@@ -127,6 +139,10 @@ def detect_events():
                 # If we have enough samples, process them
                 if samples_collected >= buffer_samples:
                     current_time = time.time()
+                    
+                    # DEBUG: Log audio signal statistics
+                    rms = np.sqrt(np.mean(audio_data**2))
+                    print(f"Audio buffer filled: RMS={rms:.4f}, Max={audio_data.max():.4f}, Min={audio_data.min():.4f}")
                     
                     # Extract features
                     features = extract_features(audio_data)
@@ -138,23 +154,74 @@ def detect_events():
                     predictions = model.predict(features, verbose=0)[0]
                     max_prob = np.max(predictions)
                     predicted_class = np.argmax(predictions)
+                    predicted_class_name = categories.get(str(predicted_class), f"Unknown-{predicted_class}")
                     
-                    # Store prediction in history
-                    recent_predictions.append((predicted_class, max_prob))
-                    if len(recent_predictions) > PREDICTION_HISTORY_SIZE:
-                        recent_predictions.pop(0)
+                    # DEBUG: Print all predictions above a minimal threshold
+                    print(f"Top predictions:")
+                    sorted_indices = np.argsort(predictions)[::-1]
+                    for idx in sorted_indices[:3]:  # Show top 3 predictions
+                        class_name = categories.get(str(idx), f"Unknown-{idx}")
+                        print(f"  {class_name}: {predictions[idx]:.4f}")
+                    
+                    # Add to prediction history with timestamp
+                    recent_predictions.append({
+                        'class': predicted_class, 
+                        'prob': max_prob,
+                        'time': current_time,
+                        'features': features.mean(axis=1).flatten()  # Store average feature vector
+                    })
+                    
+                    # Keep only recent predictions
+                    recent_predictions = [p for p in recent_predictions 
+                                         if current_time - p['time'] < 10.0]  # Last 10 seconds
                     
                     # Only process if we're not in cooldown period
-                    if current_time - last_detection_time >= cooldown_period:
-                        # Check for consistent predictions
+                    if current_time - last_detection_time >= COOLDOWN_PERIOD:
+                        # Count predictions by class and apply filters
                         class_counts = {}
-                        for cls, prob in recent_predictions:
-                            if prob >= DETECTION_THRESHOLD:
+                        class_probs = {}
+                        
+                        # Get the most recent consistent predictions (last 2 seconds)
+                        recent_consistent = [p for p in recent_predictions 
+                                           if current_time - p['time'] < 2.0]
+                        
+                        for pred in recent_consistent:
+                            cls = pred['class']
+                            prob = pred['prob']
+                            
+                            # Use the correct threshold based on the class
+                            threshold = AMBULANCE_THRESHOLD if cls == ambulance_class else DETECTION_THRESHOLD
+                            
+                            if prob >= threshold:
                                 class_counts[cls] = class_counts.get(cls, 0) + 1
+                                class_probs.setdefault(cls, []).append(prob)
+                        
+                        # Additional pattern analysis for ambulance class
+                        if ambulance_class in class_counts and class_counts[ambulance_class] >= MIN_CONSISTENT_PREDICTIONS:
+                            # Calculate coherence of predictions
+                            feature_vectors = np.array([p['features'] for p in recent_consistent 
+                                                     if p['class'] == ambulance_class])
+                            
+                            if len(feature_vectors) >= 2:
+                                # Calculate average pairwise correlation
+                                correlations = []
+                                for i in range(len(feature_vectors)):
+                                    for j in range(i+1, len(feature_vectors)):
+                                        corr = np.corrcoef(feature_vectors[i], feature_vectors[j])[0, 1]
+                                        correlations.append(corr)
+                                
+                                avg_correlation = np.mean(correlations) if correlations else 0
+                                
+                                # If coherence is low, it might be a false positive
+                                if avg_correlation < 0.7:  # Ambulance sounds should be coherent
+                                    print(f"Rejecting ambulance detection due to low coherence: {avg_correlation:.2f}")
+                                    del class_counts[ambulance_class]
+                                    del class_probs[ambulance_class]
                         
                         # Find the most consistent class with high confidence
                         most_consistent_class = None
                         most_consistent_count = 0
+                        
                         for cls, count in class_counts.items():
                             if count > most_consistent_count and count >= MIN_CONSISTENT_PREDICTIONS:
                                 most_consistent_class = cls
@@ -165,33 +232,38 @@ def detect_events():
                             event_name = categories.get(str(most_consistent_class), f"Unknown-{most_consistent_class}")
                             
                             # Calculate average confidence for this class
-                            class_probs = [prob for cls, prob in recent_predictions if cls == most_consistent_class]
-                            avg_confidence = sum(class_probs) / len(class_probs)
+                            avg_confidence = np.mean(class_probs[most_consistent_class])
                             
-                            print(f"Detected: {event_name} (confidence: {avg_confidence:.2f}, consistency: {most_consistent_count}/{PREDICTION_HISTORY_SIZE})")
-                            
-                            # Emit to web clients
-                            socketio.emit('detection', {
-                                'event': event_name,
-                                'confidence': float(avg_confidence),
-                                'consistency': most_consistent_count,
-                                'timestamp': current_time
-                            })
-                            
-                            last_detection_time = current_time
+                            # Skip consecutive detections of the same class
+                            if most_consistent_class != last_detected_class or current_time - last_detection_time >= 5.0:
+                                print(f"Detected: {event_name} (confidence: {avg_confidence:.2f}, " +
+                                      f"consistency: {most_consistent_count}/{len(recent_consistent)})")
+                                
+                                # Emit to web clients
+                                debug_emit('detection', {
+                                    'event': event_name,
+                                    'confidence': float(avg_confidence),
+                                    'consistency': most_consistent_count,
+                                    'timestamp': current_time
+                                })
+                                
+                                last_detection_time = current_time
+                                last_detected_class = most_consistent_class
                     
                     # Slide the buffer (keep the last half for overlap)
                     half_buffer = buffer_samples // 2
                     audio_data[:half_buffer] = audio_data[half_buffer:]
                     samples_collected = half_buffer
             
-            else:
-                # If queue is empty, wait a bit
-                time.sleep(0.01)
+            except queue.Empty:
+                # Queue is empty, continue waiting
+                continue
                 
         except Exception as e:
             print(f"Error in detection loop: {e}")
             time.sleep(0.1)  # Prevent tight error loops
+    
+    print("Detection thread stopped")
 
 def start_detection():
     """Start the audio stream and detection thread"""
@@ -214,6 +286,7 @@ def start_detection():
         detection_thread.daemon = True
         detection_thread.start()
         
+        print("Audio detection started")
         return True
     except Exception as e:
         print(f"Error starting detection: {e}")
@@ -223,19 +296,249 @@ def stop_detection():
     """Stop the audio stream and detection thread"""
     global stop_recording, audio_stream
     
-    # Set the stop flag to stop the detection thread
-    stop_recording.set()
+    try:
+        # Set the stop flag to stop the detection thread
+        stop_recording.set()
+        
+        # Stop the audio stream
+        if audio_stream is not None:
+            audio_stream.stop()
+            audio_stream.close()
+            audio_stream = None
+        
+        # Wait for thread to finish
+        if detection_thread and detection_thread.is_alive():
+            detection_thread.join(timeout=2.0)
+        
+        # Clear the audio buffer
+        while not audio_buffer.empty():
+            try:
+                audio_buffer.get_nowait()
+            except queue.Empty:
+                break
+        
+        print("Audio detection stopped")
+        return True
+    except Exception as e:
+        print(f"Error stopping detection: {e}")
+        return False
+
+def calibrate_background_noise(duration=10.0):
+    """Record background noise and calibrate the system"""
+    global audio_stream, audio_buffer, model, BACKGROUND_NOISE_SAMPLES, class_thresholds
     
-    # Wait for thread to finish
-    if detection_thread and detection_thread.is_alive():
-        detection_thread.join(timeout=2.0)
+    print(f"Calibrating background noise for {duration} seconds...")
+    print("Please remain quiet during calibration...")
     
-    # Stop the audio stream
-    if audio_stream:
-        audio_stream.stop()
-        audio_stream.close()
+    # Clear any existing audio in the buffer
+    while not audio_buffer.empty():
+        audio_buffer.get()
     
-    return True
+    # Start audio stream if not already started
+    temp_stream = None
+    if audio_stream is None:
+        temp_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            callback=audio_callback
+        )
+        temp_stream.start()
+    
+    # Collect background noise samples
+    buffer_samples = int(SAMPLE_RATE * duration)
+    noise_samples = np.zeros(buffer_samples)
+    samples_collected = 0
+    
+    start_time = time.time()
+    while samples_collected < buffer_samples and (time.time() - start_time) < duration + 1:
+        if not audio_buffer.empty():
+            new_data = audio_buffer.get()
+            data_length = min(len(new_data), buffer_samples - samples_collected)
+            noise_samples[samples_collected:samples_collected + data_length] = new_data[:data_length]
+            samples_collected += data_length
+        else:
+            time.sleep(0.01)
+    
+    # Stop the temporary stream if we created one
+    if temp_stream is not None:
+        temp_stream.stop()
+        temp_stream.close()
+    
+    # Clear the buffer again
+    while not audio_buffer.empty():
+        audio_buffer.get()
+    
+    print(f"Collected {samples_collected/SAMPLE_RATE:.1f} seconds of background noise")
+    
+    # Process the background noise to understand its characteristics
+    if samples_collected > 0:
+        # Divide into 1-second segments for multiple samples
+        segment_length = SAMPLE_RATE
+        num_segments = samples_collected // segment_length
+        
+        class_activations = {}
+        
+        print(f"Analyzing {num_segments} segments of background noise...")
+        
+        for i in range(num_segments):
+            segment = noise_samples[i*segment_length:(i+1)*segment_length]
+            
+            # Extract features from the noise segment
+            features = extract_features(segment)
+            
+            # Store the noise profile
+            BACKGROUND_NOISE_SAMPLES.append(features)
+            
+            # Reshape for model input (add batch dimension)
+            features = np.expand_dims(features, axis=0)
+            
+            # Check what the model predicts for background noise
+            if model is not None:
+                predictions = model.predict(features, verbose=0)[0]
+                
+                # Track which classes are activated by background noise
+                for j, prob in enumerate(predictions):
+                    class_activations.setdefault(j, []).append(prob)
+        
+        # Set class-specific thresholds based on background noise
+        for cls, activations in class_activations.items():
+            mean_activation = np.mean(activations)
+            std_activation = np.std(activations)
+            
+            event_name = categories.get(str(cls), f"Unknown-{cls}")
+            
+            # Set threshold higher for classes activated by background noise
+            if mean_activation > 0.1:
+                # Dynamic threshold: base + (mean + 2*std)
+                class_thresholds[cls] = min(0.98, DETECTION_THRESHOLD + mean_activation + 2*std_activation)
+                print(f"Class {event_name} activated by background ({mean_activation:.3f}±{std_activation:.3f})")
+                print(f"Setting higher threshold for {event_name}: {class_thresholds[cls]:.3f}")
+            
+        # Count which environment classes are most frequently predicted
+        predictions = [np.argmax(model.predict(np.expand_dims(features, axis=0), verbose=0)[0]) 
+                     for features in BACKGROUND_NOISE_SAMPLES]
+        
+        classes, counts = np.unique(predictions, return_counts=True)
+        for i, cls in enumerate(classes):
+            event_name = categories.get(str(cls), f"Unknown-{cls}")
+            print(f"Background noise classified as {event_name}: {counts[i]/len(predictions)*100:.1f}%")
+            
+            # If this class appears frequently in background, increase its threshold dramatically
+            if counts[i]/len(predictions) > 0.3:  # If >30% of background classified as this
+                class_thresholds[cls] = 0.98  # Very high threshold
+                print(f"WARNING: {event_name} appears frequently in background noise")
+                print(f"Setting very high threshold for {event_name}: {class_thresholds[cls]:.3f}")
+        
+        print("Background noise calibration complete.")
+        print("Class-specific detection thresholds:")
+        for cls, threshold in class_thresholds.items():
+            event_name = categories.get(str(cls), f"Unknown-{cls}")
+            print(f"  {event_name}: {threshold:.3f}")
+    
+    return BACKGROUND_NOISE_SAMPLES
+
+def analyze_model_confusion():
+    """Analyze potential model confusion between classes"""
+    global model, categories, BACKGROUND_NOISE_SAMPLES
+    
+    if not BACKGROUND_NOISE_SAMPLES or model is None:
+        print("No background samples available for analysis")
+        return
+    
+    print("\nAnalyzing potential model confusion...")
+    
+    # Get predictions for all background samples
+    all_preds = []
+    for features in BACKGROUND_NOISE_SAMPLES:
+        features = np.expand_dims(features, axis=0)
+        pred = model.predict(features, verbose=0)[0]
+        all_preds.append(pred)
+    
+    all_preds = np.array(all_preds)
+    
+    # For each class, see if it's consistently confused with background
+    avg_activations = np.mean(all_preds, axis=0)
+    
+    print("\nClass activations on background noise:")
+    for i, avg_act in enumerate(avg_activations):
+        if avg_act > 0.1:  # Only show classes with significant activations
+            event_name = categories.get(str(i), f"Unknown-{i}")
+            print(f"  {event_name}: {avg_act:.4f}")
+    
+    # Check if there's an environment audio class
+    env_audio_idx = -1
+    for idx, name in categories.items():
+        if name.lower() in ['env_audio', 'environment', 'background', 'ambient']:
+            env_audio_idx = int(idx)
+            break
+    
+    if env_audio_idx >= 0:
+        print(f"\nFound environment audio class (index {env_audio_idx})")
+        
+        # Check if the environment audio class is properly classified
+        env_audio_detections = 0
+        for pred in all_preds:
+            if np.argmax(pred) == env_audio_idx:
+                env_audio_detections += 1
+        
+        print(f"Background correctly classified as environment: {env_audio_detections}/{len(all_preds)} " +
+              f"({env_audio_detections/len(all_preds)*100:.1f}%)")
+        
+        if env_audio_detections / len(all_preds) < 0.5:
+            print("WARNING: Model doesn't consistently recognize background as environment audio")
+            print("Consider retraining the model with more environment samples")
+    
+    # Optional: Exclude specific problematic classes from detection
+    print("\nAutomatically excluding problematic classes...")
+    
+    excluded_classes = []
+    # Automatically exclude classes that are frequently activated by background
+    for i, avg_act in enumerate(avg_activations):
+        if avg_act > 0.2:  # Threshold for automatic exclusion
+            excluded_classes.append(i)
+            event_name = categories.get(str(i), f"Unknown-{i}")
+            print(f"Excluding class {event_name} (activation: {avg_act:.4f})")
+    
+    # Set extremely high thresholds for excluded classes
+    for cls in excluded_classes:
+        if cls in range(len(categories)):
+            class_thresholds[cls] = 0.999  # Effectively disable detection
+            event_name = categories.get(str(cls), f"Unknown-{cls}")
+            print(f"Excluded class {event_name} (index {cls}) from detection")
+
+def cleanup():
+    """Clean up resources when the application shuts down"""
+    print("Cleaning up resources...")
+    global audio_stream
+    
+    # Stop detection if it's running
+    stop_detection()
+    
+    # Make sure audio stream is closed
+    if (audio_stream):
+        try:
+            audio_stream.stop()
+            audio_stream.close()
+        except Exception as e:
+            print(f"Error closing audio stream: {e}")
+    
+    # Clear any remaining items in the queue
+    while not audio_buffer.empty():
+        try:
+            audio_buffer.get_nowait()
+        except queue.Empty:
+            break
+
+# Add this debug function
+def debug_emit(event, data):
+    """Wrapper for socketio.emit that adds debugging"""
+    print(f"EMITTING {event}: {data}")
+    socketio.emit(event, data)
+
+# Register cleanup handlers
+atexit.register(cleanup)
+signal.signal(signal.SIGINT, lambda sig, frame: cleanup())
+signal.signal(signal.SIGTERM, lambda sig, frame: cleanup())
 
 # Flask routes
 @app.route('/')
@@ -279,14 +582,65 @@ def handle_connect():
         'is_detecting': detection_thread is not None and detection_thread.is_alive()
     })
 
+@socketio.on('client_test')
+def handle_client_test(data):
+    print(f"Received client_test: {data}")
+    socketio.emit('server_test', {'response': 'Server received your message', 'timestamp': time.time()})
+
+# Add this after your SocketIO events
+@app.errorhandler(Exception)
+def handle_error(e):
+    print(f"Flask error: {str(e)}")
+    import traceback
+    traceback.print_exc()
+    return jsonify(error=str(e)), 500
+
+# Add this route at the end of your Flask routes section
+@app.route('/test_detection', methods=['GET'])
+def test_detection():
+    """Force a test detection event for debugging"""
+    print("TEST DETECTION endpoint called")
+    current_time = time.time()
+    
+    test_data = {
+        'event': "test_event",
+        'confidence': 0.95,
+        'consistency': 5,
+        'timestamp': current_time
+    }
+    
+    print(f"Emitting test detection: {test_data}")
+    socketio.emit('detection', test_data)
+    
+    # Try with namespace too as a backup
+    socketio.emit('detection', test_data, namespace='/')
+    
+    return jsonify({
+        'success': True, 
+        'message': 'Test detection event emitted',
+        'timestamp': current_time
+    })
+
 # Main function
 if __name__ == '__main__':
     try:
         # Load model
         load_trained_model()
         
+        # Initialize class-specific thresholds
+        class_thresholds = {int(idx): DETECTION_THRESHOLD for idx in categories}
+        
+        # Calibrate with background noise
+        bg_noise = calibrate_background_noise(10.0)
+        
+        # Analyze potential confusion in the model
+        analyze_model_confusion()
+        
         # Start Flask server
         print("Starting server on http://127.0.0.1:2500")
-        socketio.run(app, debug=True, host='0.0.0.0', port=2500)
+        socketio.run(app, debug=True, host='0.0.0.0', port=2500, allow_unsafe_werkzeug=True)
     except Exception as e:
         print(f"Error: {e}")
+    finally:
+        # Make sure we clean up on exit
+        cleanup()
