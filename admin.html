@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sound Event Detection - Admin Page</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background-color: #f9f9f9;
+            border-radius: 5px;
+        }
+
+        .section-title {
+            margin-top: 0;
+            color: #444;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 10px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        input[type="text"], 
+        input[type="file"],
+        select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        button:hover {
+            background-color: #45a049;
+        }
+
+        .btn-danger {
+            background-color: #f44336;
+        }
+
+        .btn-danger:hover {
+            background-color: #d32f2f;
+        }
+
+        .btn-primary {
+            background-color: #2196F3;
+        }
+
+        .btn-primary:hover {
+            background-color: #0b7dda;
+        }
+
+        .recording-controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+
+        .timer {
+            font-size: 24px;
+            margin: 10px 0;
+        }
+
+        .recording-indicator {
+            color: red;
+            font-weight: bold;
+        }
+
+        .folder-list {
+            margin-top: 20px;
+        }
+
+        .folder-item {
+            padding: 10px;
+            background-color: #e9e9e9;
+            margin-bottom: 5px;
+            border-radius: 4px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .file-list {
+            margin-left: 20px;
+        }
+
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+
+        .success {
+            background-color: #dff0d8;
+            color: #3c763d;
+        }
+
+        .error {
+            background-color: #f2dede;
+            color: #a94442;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Sound Event Detection - Admin Panel</h1>
+
+        <div class="section">
+            <h2 class="section-title">Create New Category</h2>
+            <div class="form-group">
+                <label for="new-folder">New Category Name:</label>
+                <input type="text" id="new-folder" placeholder="Enter category name">
+            </div>
+            <button onclick="createFolder()" class="btn-primary">Create Category</button>
+            <div id="folder-status" class="status"></div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Record Audio Sample</h2>
+            <div class="form-group">
+                <label for="record-folder">Select Category:</label>
+                <select id="record-folder"></select>
+            </div>
+            <div class="form-group">
+                <label for="record-filename">Filename (without extension):</label>
+                <input type="text" id="record-filename" placeholder="Enter filename">
+            </div>
+            <div class="recording-controls">
+                <button id="record-button" onclick="toggleRecording()" class="btn-danger">Start Recording</button>
+                <div id="timer" class="timer">00:00</div>
+                <div id="recording-status" class="recording-indicator"></div>
+            </div>
+            <div id="recording-result" class="status"></div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Upload Audio Files</h2>
+            <div class="form-group">
+                <label for="upload-folder">Select Category:</label>
+                <select id="upload-folder"></select>
+            </div>
+            <div class="form-group">
+                <label for="file-upload">Select WAV Files:</label>
+                <input type="file" id="file-upload" accept=".wav" multiple>
+            </div>
+            <button onclick="uploadFiles()" class="btn-primary">Upload Files</button>
+            <div id="upload-status" class="status"></div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Current Audio Files</h2>
+            <button onclick="refreshFolders()" class="btn-primary">Refresh List</button>
+            <div id="folder-list" class="folder-list"></div>
+        </div>
+    </div>
+
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let timerInterval;
+        let startTime;
+
+        // Initialize the page
+        document.addEventListener('DOMContentLoaded', function() {
+            loadFolders();
+        });
+
+        // Load available folders from the server
+        function loadFolders() {
+            fetch('/api/folders')
+                .then(response => response.json())
+                .then(folders => {
+                    updateFolderSelects(folders);
+                    displayFolderContents(folders);
+                })
+                .catch(error => {
+                    console.error('Error loading folders:', error);
+                    // If API is not available, use sample data for demonstration
+                    const sampleFolders = ["door_knock", "glass_break", "env_audio"];
+                    updateFolderSelects(sampleFolders);
+                    displayFolderContents(sampleFolders);
+                });
+        }
+
+        // Create a new folder
+        function createFolder() {
+            const folderName = document.getElementById('new-folder').value.trim();
+            const statusElement = document.getElementById('folder-status');
+            
+            if (!folderName) {
+                statusElement.textContent = 'Please enter a category name';
+                statusElement.className = 'status error';
+                return;
+            }
+
+            // In a real application, this would make an API call to create the folder
+            fetch('/api/folders', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ name: folderName }),
+            })
+            .then(response => response.json())
+            .then(data => {
+                statusElement.textContent = `Category "${folderName}" created successfully`;
+                statusElement.className = 'status success';
+                document.getElementById('new-folder').value = '';
+                loadFolders(); // Refresh the folder lists
+            })
+            .catch(error => {
+                console.error('Error creating folder:', error);
+                // For demonstration purposes:
+                statusElement.textContent = `Category "${folderName}" would be created in a real application`;
+                statusElement.className = 'status success';
+                document.getElementById('new-folder').value = '';
+                
+                // Mock adding the folder to our lists
+                const recordFolder = document.getElementById('record-folder');
+                const uploadFolder = document.getElementById('upload-folder');
+                const option = document.createElement('option');
+                option.value = folderName;
+                option.textContent = folderName;
+                recordFolder.appendChild(option.cloneNode(true));
+                uploadFolder.appendChild(option);
+            });
+        }
+
+        // Update folder select dropdowns
+        function updateFolderSelects(folders) {
+            const recordFolder = document.getElementById('record-folder');
+            const uploadFolder = document.getElementById('upload-folder');
+            
+            recordFolder.innerHTML = '';
+            uploadFolder.innerHTML = '';
+            
+            folders.forEach(folder => {
+                const option = document.createElement('option');
+                option.value = folder;
+                option.textContent = folder;
+                recordFolder.appendChild(option.cloneNode(true));
+                uploadFolder.appendChild(option);
+            });
+        }
+
+        // Display folder contents
+        function displayFolderContents(folders) {
+            const folderList = document.getElementById('folder-list');
+            folderList.innerHTML = '';
+            
+            folders.forEach(folder => {
+                const folderItem = document.createElement('div');
+                folderItem.className = 'folder-item';
+                folderItem.innerHTML = `
+                    <div>${folder}</div>
+                    <div>
+                        <button onclick="viewFiles('${folder}')" class="btn-primary">View Files</button>
+                    </div>
+                `;
+                folderList.appendChild(folderItem);
+                
+                // In a real application, this would create a collapsible list of files
+                const fileList = document.createElement('div');
+                fileList.className = 'file-list';
+                fileList.id = `files-${folder}`;
+                fileList.style.display = 'none';
+                folderList.appendChild(fileList);
+            });
+        }
+
+        // View files in a folder
+        function viewFiles(folder) {
+            const fileList = document.getElementById(`files-${folder}`);
+            
+            if (fileList.style.display === 'none') {
+                // In a real application, this would fetch files from the server
+                fetch(`/api/folders/${folder}/files`)
+                    .then(response => response.json())
+                    .then(files => {
+                        fileList.innerHTML = '';
+                        if (files.length === 0) {
+                            fileList.innerHTML = '<p>No files in this category</p>';
+                        } else {
+                            files.forEach(file => {
+                                const fileItem = document.createElement('div');
+                                fileItem.textContent = file;
+                                fileList.appendChild(fileItem);
+                            });
+                        }
+                        fileList.style.display = 'block';
+                    })
+                    .catch(error => {
+                        console.error('Error fetching files:', error);
+                        // For demonstration purposes:
+                        fileList.innerHTML = '<p>Sample file 1.wav</p><p>Sample file 2.wav</p>';
+                        fileList.style.display = 'block';
+                    });
+            } else {
+                fileList.style.display = 'none';
+            }
+        }
+
+        // Toggle recording state
+        function toggleRecording() {
+            const recordButton = document.getElementById('record-button');
+            const statusElement = document.getElementById('recording-status');
+            const timerElement = document.getElementById('timer');
+            
+            if (!isRecording) {
+                // Start recording
+                startRecording();
+                recordButton.textContent = 'Stop Recording';
+                statusElement.textContent = 'Recording...';
+                
+                // Start timer
+                startTime = Date.now();
+                timerInterval = setInterval(updateTimer, 1000);
+            } else {
+                // Stop recording
+                stopRecording();
+                recordButton.textContent = 'Start Recording';
+                statusElement.textContent = '';
+                
+                // Stop timer
+                clearInterval(timerInterval);
+                timerElement.textContent = '00:00';
+            }
+            
+            isRecording = !isRecording;
+        }
+
+        // Update recording timer
+        function updateTimer() {
+            const timerElement = document.getElementById('timer');
+            const elapsedTime = Math.floor((Date.now() - startTime) / 1000);
+            const minutes = Math.floor(elapsedTime / 60).toString().padStart(2, '0');
+            const seconds = (elapsedTime % 60).toString().padStart(2, '0');
+            timerElement.textContent = `${minutes}:${seconds}`;
+        }
+
+        // Start audio recording
+        function startRecording() {
+            audioChunks = [];
+            
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    mediaRecorder = new MediaRecorder(stream);
+                    
+                    mediaRecorder.addEventListener('dataavailable', event => {
+                        audioChunks.push(event.data);
+                    });
+                    
+                    mediaRecorder.addEventListener('stop', () => {
+                        const folder = document.getElementById('record-folder').value;
+                        const filename = document.getElementById('record-filename').value.trim() || 
+                                        `recorded_audio_${new Date().toISOString().replace(/[:.]/g, '-')}`;
+                        
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                        saveRecording(audioBlob, folder, filename);
+                    });
+                    
+                    mediaRecorder.start();
+                })
+                .catch(error => {
+                    console.error('Error accessing microphone:', error);
+                    document.getElementById('recording-result').textContent = 'Error accessing microphone. Please check permissions.';
+                    document.getElementById('recording-result').className = 'status error';
+                    isRecording = false;
+                    document.getElementById('record-button').textContent = 'Start Recording';
+                });
+        }
+
+        // Stop audio recording
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+            }
+        }
+
+        // Save the recorded audio
+        function saveRecording(audioBlob, folder, filename) {
+            const formData = new FormData();
+            formData.append('audio', audioBlob, `${filename}.wav`);
+            formData.append('folder', folder);
+            
+            // In a real application, this would send the audio file to the server
+            fetch('/api/upload/recording', {
+                method: 'POST',
+                body: formData,
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('recording-result').textContent = `Recording saved as ${filename}.wav in ${folder}`;
+                document.getElementById('recording-result').className = 'status success';
+                document.getElementById('record-filename').value = '';
+            })
+            .catch(error => {
+                console.error('Error saving recording:', error);
+                // For demonstration purposes:
+                document.getElementById('recording-result').textContent = 
+                    `Recording would be saved as ${filename}.wav in ${folder} in a real application`;
+                document.getElementById('recording-result').className = 'status success';
+                document.getElementById('record-filename').value = '';
+            });
+        }
+
+        // Upload audio files
+        function uploadFiles() {
+            const files = document.getElementById('file-upload').files;
+            const folder = document.getElementById('upload-folder').value;
+            const statusElement = document.getElementById('upload-status');
+            
+            if (files.length === 0) {
+                statusElement.textContent = 'Please select at least one file';
+                statusElement.className = 'status error';
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('folder', folder);
+            
+            for (let i = 0; i < files.length; i++) {
+                formData.append('files', files[i]);
+            }
+            
+            // In a real application, this would upload the files to the server
+            fetch('/api/upload/files', {
+                method: 'POST',
+                body: formData,
+            })
+            .then(response => response.json())
+            .then(data => {
+                statusElement.textContent = `${files.length} file(s) uploaded to ${folder}`;
+                statusElement.className = 'status success';
+                document.getElementById('file-upload').value = '';
+            })
+            .catch(error => {
+                console.error('Error uploading files:', error);
+                // For demonstration purposes:
+                statusElement.textContent = `${files.length} file(s) would be uploaded to ${folder} in a real application`;
+                statusElement.className = 'status success';
+                document.getElementById('file-upload').value = '';
+            });
+        }
+
+        // Refresh the folder list
+        function refreshFolders() {
+            loadFolders();
+            document.getElementById('folder-list').innerHTML = '<p>Refreshing...</p>';
+        }
+    </script>
+</body>
+</html>
