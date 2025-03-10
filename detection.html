@@ -172,13 +172,13 @@
             border-radius: 15px;
             font-size: 14px;
         }
-
-        /* Add this for highlighting new entries */
+        
+        /* Add highlighting for new entries */
         @keyframes highlight {
             0% { background-color: #ffff99; }
             100% { background-color: inherit; }
         }
-
+        
         .highlight {
             animation: highlight 2s ease-out;
         }
@@ -192,6 +192,7 @@
             <h2 class="section-title">System Status</h2>
             <div id="model-status" class="status inactive">Model: Loading...</div>
             <div id="detection-status" class="status inactive">Detection: Inactive</div>
+            <div id="socket-status" class="status inactive">Socket: Disconnected</div>
             
             <h3>Available Categories</h3>
             <div id="categories-list" class="categories-list">
@@ -215,267 +216,288 @@
     </div>
 
     <script>
-    document.addEventListener('DOMContentLoaded', function() {
-        console.log("DOM loaded, setting up Socket.IO");
-        
-        const startBtn = document.getElementById('start-btn');
-        const stopBtn = document.getElementById('stop-btn');
-        const modelStatus = document.getElementById('model-status');
-        const detectionStatus = document.getElementById('detection-status');
-        const categoriesList = document.getElementById('categories-list');
-        const detectionLog = document.getElementById('detection-log');
-        
-        // Connect to Socket.IO server - ONE connection only
-        const socket = io();
-        
-        // Get initial status
-        fetch('/status')
-            .then(response => response.json())
-            .then(data => {
-                updateModelStatus(data.model_loaded);
-                updateDetectionStatus(data.is_detecting);
-                updateCategories(data.categories);
-                
-                // Enable/disable buttons based on status
-                startBtn.disabled = !data.model_loaded || data.is_detecting;
-                stopBtn.disabled = !data.is_detecting;
-            })
-            .catch(error => {
-                console.error('Error fetching status:', error);
-                showError('Failed to connect to the server.');
-            });
-        
-        // Socket.IO event listeners
-        socket.on('connect', function() {
-            console.log('Socket connected!', socket.id);
-            showMessage('Socket connected with ID: ' + socket.id);
-        });
-        
-        socket.on('disconnect', function(reason) {
-            console.log('Disconnected from server:', reason);
-            updateDetectionStatus(false);
-            startBtn.disabled = true;
-            stopBtn.disabled = true;
-            showError('Connection to server lost: ' + reason);
-        });
-        
-        socket.on('connect_error', function(error) {
-            console.log('Connection error:', error);
-            showError('Connection error: ' + error);
-        });
-        
-        socket.on('status', function(data) {
-            updateModelStatus(data.model_loaded);
-            updateDetectionStatus(data.is_detecting);
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log("DOM loaded, setting up Socket.IO");
             
-            startBtn.disabled = !data.model_loaded || data.is_detecting;
-            stopBtn.disabled = !data.is_detecting;
-        });
-        
-        socket.on('detection', function(data) {
-            console.log('Detection received:', data);
-            addDetectionToLog(data);
-        });
-
-        // Add debugging for ALL events
-        socket.onAny((event, ...args) => {
-            console.log(`Received event: ${event}`, args);
-        });
-        
-        // Button click handlers
-        startBtn.addEventListener('click', function() {
-            fetch('/start', {
-                method: 'POST'
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    updateDetectionStatus(true);
-                    startBtn.disabled = true;
-                    stopBtn.disabled = false;
-                } else {
-                    showError('Failed to start detection.');
-                }
-            })
-            .catch(error => {
-                console.error('Error starting detection:', error);
-                showError('Failed to start detection.');
+            const startBtn = document.getElementById('start-btn');
+            const stopBtn = document.getElementById('stop-btn');
+            const modelStatus = document.getElementById('model-status');
+            const detectionStatus = document.getElementById('detection-status');
+            const socketStatus = document.getElementById('socket-status');
+            const categoriesList = document.getElementById('categories-list');
+            const detectionLog = document.getElementById('detection-log');
+            
+            // Connect to Socket.IO server with explicit options
+            const socket = io({
+                transports: ['websocket', 'polling'],
+                reconnection: true,
+                reconnectionAttempts: 5,
+                reconnectionDelay: 1000
             });
-        });
-        
-        stopBtn.addEventListener('click', function() {
-            fetch('/stop', {
-                method: 'POST'
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    updateDetectionStatus(false);
-                    startBtn.disabled = false;
-                    stopBtn.disabled = true;
-                } else {
-                    showError('Failed to stop detection.');
-                }
-            })
-            .catch(error => {
-                console.error('Error stopping detection:', error);
-                showError('Failed to stop detection.');
-            });
-        });
-        
-        // Add test button
-        const testBtn = document.createElement('button');
-        testBtn.innerText = 'Test Event';
-        testBtn.className = 'btn';
-        testBtn.style.backgroundColor = '#9c27b0';
-        testBtn.style.color = 'white';
-        testBtn.onclick = function() {
-            console.log('Sending test event request');
-            fetch('/test_detection')
+            
+            // Get initial status
+            fetch('/status')
                 .then(response => response.json())
                 .then(data => {
-                    console.log('Test detection sent:', data);
-                    showMessage('Test detection sent: ' + JSON.stringify(data));
+                    console.log("Status response:", data);
+                    updateModelStatus(data.model_loaded);
+                    updateDetectionStatus(data.is_detecting);
+                    updateCategories(data.categories);
+                    
+                    // Enable/disable buttons based on status
+                    startBtn.disabled = !data.model_loaded || data.is_detecting;
+                    stopBtn.disabled = !data.is_detecting;
                 })
                 .catch(error => {
-                    console.error('Error sending test detection:', error);
-                    showError('Error sending test detection: ' + error);
+                    console.error('Error fetching status:', error);
+                    showError('Failed to connect to the server.');
                 });
-        };
-        
-        document.querySelector('.controls').appendChild(testBtn);
-        
-        // Add another test button for direct socket test
-        const socketTestBtn = document.createElement('button');
-        socketTestBtn.innerText = 'Socket Test';
-        socketTestBtn.className = 'btn';
-        socketTestBtn.style.backgroundColor = '#2196F3';
-        socketTestBtn.style.color = 'white';
-        socketTestBtn.style.marginLeft = '10px';
-        socketTestBtn.onclick = function() {
-            console.log('Sending direct socket test');
-            socket.emit('client_test', {message: 'Hello from client!', timestamp: Date.now()});
-            showMessage('Socket test sent. Check console for response.');
-        };
-        
-        document.querySelector('.controls').appendChild(socketTestBtn);
-        
-        // Add listener for server test response
-        socket.on('server_test', function(data) {
-            console.log('Received server test:', data);
-            showMessage('Server test response: ' + JSON.stringify(data));
-        });
-        
-        // Helper functions
-        function updateModelStatus(isLoaded) {
-            if (isLoaded) {
-                modelStatus.textContent = 'Model: Loaded';
-                modelStatus.className = 'status active';
-            } else {
-                modelStatus.textContent = 'Model: Not loaded';
-                modelStatus.className = 'status inactive';
-            }
-        }
-        
-        function updateDetectionStatus(isActive) {
-            if (isActive) {
-                detectionStatus.textContent = 'Detection: Active';
-                detectionStatus.className = 'status active';
-            } else {
-                detectionStatus.textContent = 'Detection: Inactive';
-                detectionStatus.className = 'status inactive';
-            }
             
-            startBtn.disabled = isActive;
-            stopBtn.disabled = !isActive;
-        }
-        
-        function updateCategories(categories) {
-            if (!categories || categories.length === 0) {
-                categoriesList.innerHTML = '<div class="category-tag">No categories available</div>';
-                return;
-            }
-            
-            categoriesList.innerHTML = '';
-            categories.forEach(category => {
-                const tag = document.createElement('div');
-                tag.className = 'category-tag';
-                tag.textContent = category;
-                categoriesList.appendChild(tag);
+            // Socket.IO event listeners
+            socket.on('connect', function() {
+                console.log('Socket connected!', socket.id);
+                socketStatus.textContent = 'Socket: Connected';
+                socketStatus.className = 'status active';
+                showMessage('Socket connected with ID: ' + socket.id);
             });
-        }
-        
-        function addDetectionToLog(detection) {
-            console.log("Adding detection to log:", detection);
             
-            // Clear "waiting" message if it's the first detection
-            if (detectionLog.querySelector('div').textContent === 'Waiting for events...') {
-                detectionLog.innerHTML = '';
+            socket.on('disconnect', function(reason) {
+                console.log('Disconnected from server:', reason);
+                socketStatus.textContent = 'Socket: Disconnected';
+                socketStatus.className = 'status inactive';
+                updateDetectionStatus(false);
+                startBtn.disabled = true;
+                stopBtn.disabled = true;
+                showError('Connection to server lost: ' + reason);
+            });
+            
+            socket.on('connect_error', function(error) {
+                console.log('Connection error:', error);
+                socketStatus.textContent = 'Socket: Error';
+                socketStatus.className = 'status inactive';
+                showError('Connection error: ' + error);
+            });
+            
+            socket.on('status', function(data) {
+                console.log('Received status update:', data);
+                updateModelStatus(data.model_loaded);
+                updateDetectionStatus(data.is_detecting);
+                
+                startBtn.disabled = !data.model_loaded || data.is_detecting;
+                stopBtn.disabled = !data.is_detecting;
+            });
+            
+            socket.on('detection', function(data) {
+                console.log('Detection received:', data);
+                addDetectionToLog(data);
+            });
+            
+            socket.on('server_test', function(data) {
+                console.log('Server test received:', data);
+                showMessage('Server test response: ' + JSON.stringify(data));
+            });
+            
+            // Add debugging for ALL events
+            socket.onAny((event, ...args) => {
+                console.log(`Received socket event: ${event}`, args);
+            });
+            
+            // Button click handlers
+            startBtn.addEventListener('click', function() {
+                console.log('Start button clicked');
+                fetch('/start', {
+                    method: 'POST'
+                })
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Start response:', data);
+                    if (data.success) {
+                        updateDetectionStatus(true);
+                        startBtn.disabled = true;
+                        stopBtn.disabled = false;
+                        showMessage('Detection started');
+                    } else {
+                        showError('Failed to start detection.');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error starting detection:', error);
+                    showError('Failed to start detection: ' + error);
+                });
+            });
+            
+            stopBtn.addEventListener('click', function() {
+                console.log('Stop button clicked');
+                fetch('/stop', {
+                    method: 'POST'
+                })
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Stop response:', data);
+                    if (data.success) {
+                        updateDetectionStatus(false);
+                        startBtn.disabled = false;
+                        stopBtn.disabled = true;
+                        showMessage('Detection stopped');
+                    } else {
+                        showError('Failed to stop detection.');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error stopping detection:', error);
+                    showError('Failed to stop detection: ' + error);
+                });
+            });
+            
+            // Add test button
+            const testBtn = document.createElement('button');
+            testBtn.innerText = 'Test Event';
+            testBtn.className = 'btn';
+            testBtn.style.backgroundColor = '#9c27b0';
+            testBtn.style.color = 'white';
+            testBtn.onclick = function() {
+                console.log('Sending test event request');
+                fetch('/test_detection')
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log('Test detection sent:', data);
+                        showMessage('Test detection sent: ' + JSON.stringify(data));
+                    })
+                    .catch(error => {
+                        console.error('Error sending test detection:', error);
+                        showError('Error sending test detection: ' + error);
+                    });
+            };
+            
+            document.querySelector('.controls').appendChild(testBtn);
+            
+            // Add another test button for direct socket test
+            const socketTestBtn = document.createElement('button');
+            socketTestBtn.innerText = 'Socket Test';
+            socketTestBtn.className = 'btn';
+            socketTestBtn.style.backgroundColor = '#2196F3';
+            socketTestBtn.style.color = 'white';
+            socketTestBtn.style.marginLeft = '10px';
+            socketTestBtn.onclick = function() {
+                console.log('Sending direct socket test');
+                socket.emit('client_test', {message: 'Hello from client!', timestamp: Date.now()});
+                showMessage('Socket test sent. Check console for response.');
+            };
+            
+            document.querySelector('.controls').appendChild(socketTestBtn);
+            
+            // Helper functions
+            function updateModelStatus(isLoaded) {
+                if (isLoaded) {
+                    modelStatus.textContent = 'Model: Loaded';
+                    modelStatus.className = 'status active';
+                } else {
+                    modelStatus.textContent = 'Model: Not loaded';
+                    modelStatus.className = 'status inactive';
+                }
             }
             
-            const item = document.createElement('div');
+            function updateDetectionStatus(isActive) {
+                if (isActive) {
+                    detectionStatus.textContent = 'Detection: Active';
+                    detectionStatus.className = 'status active';
+                } else {
+                    detectionStatus.textContent = 'Detection: Inactive';
+                    detectionStatus.className = 'status inactive';
+                }
+                
+                startBtn.disabled = isActive;
+                stopBtn.disabled = !isActive;
+            }
             
-            // Set confidence class
-            if (detection.confidence >= 0.9) {
-                item.className = 'detection-item high-confidence highlight';
-            } else if (detection.confidence >= 0.75) {
-                item.className = 'detection-item medium-confidence highlight';
-            } else {
+            function updateCategories(categories) {
+                if (!categories || categories.length === 0) {
+                    categoriesList.innerHTML = '<div class="category-tag">No categories available</div>';
+                    return;
+                }
+                
+                categoriesList.innerHTML = '';
+                categories.forEach(category => {
+                    const tag = document.createElement('div');
+                    tag.className = 'category-tag';
+                    tag.textContent = category;
+                    categoriesList.appendChild(tag);
+                });
+            }
+            
+            function addDetectionToLog(detection) {
+                console.log("Adding detection to log:", detection);
+                
+                // Clear "waiting" message if it's the first detection
+                if (detectionLog.querySelector('div').textContent === 'Waiting for events...') {
+                    detectionLog.innerHTML = '';
+                }
+                
+                const item = document.createElement('div');
+                
+                // Set confidence class
+                if (detection.confidence >= 0.9) {
+                    item.className = 'detection-item high-confidence highlight';
+                } else if (detection.confidence >= 0.75) {
+                    item.className = 'detection-item medium-confidence highlight';
+                } else {
+                    item.className = 'detection-item low-confidence highlight';
+                }
+                
+                let timeString;
+                try {
+                    const date = new Date(detection.timestamp * 1000);
+                    timeString = date.toLocaleTimeString();
+                } catch (e) {
+                    timeString = new Date().toLocaleTimeString();
+                    console.error("Error formatting timestamp:", e);
+                }
+                
+                item.innerHTML = `
+                    <div class="event-name">${detection.event}</div>
+                    <div>Confidence: ${Math.round(detection.confidence * 100)}%</div>
+                    <div class="confidence-bar">
+                        <div class="confidence-fill" style="width: ${detection.confidence * 100}%"></div>
+                    </div>
+                    <div class="timestamp">${timeString}</div>
+                `;
+                
+                detectionLog.insertBefore(item, detectionLog.firstChild);
+                
+                // Keep only the latest 50 detections
+                const items = detectionLog.getElementsByClassName('detection-item');
+                if (items.length > 50) {
+                    detectionLog.removeChild(items[items.length - 1]);
+                }
+                
+                // Scroll to make sure the new entry is visible
+                detectionLog.scrollTop = 0;
+            }
+            
+            function showError(message) {
+                const item = document.createElement('div');
                 item.className = 'detection-item low-confidence highlight';
+                item.innerHTML = `
+                    <div class="event-name">Error</div>
+                    <div>${message}</div>
+                    <div class="timestamp">${new Date().toLocaleTimeString()}</div>
+                `;
+                detectionLog.insertBefore(item, detectionLog.firstChild);
+                detectionLog.scrollTop = 0;
             }
             
-            let timeString;
-            try {
-                const date = new Date(detection.timestamp * 1000);
-                timeString = date.toLocaleTimeString();
-            } catch (e) {
-                timeString = new Date().toLocaleTimeString();
-                console.error("Error formatting timestamp:", e);
+            function showMessage(message) {
+                const item = document.createElement('div');
+                item.className = 'detection-item highlight';
+                item.innerHTML = `
+                    <div class="event-name">System Message</div>
+                    <div>${message}</div>
+                    <div class="timestamp">${new Date().toLocaleTimeString()}</div>
+                `;
+                detectionLog.insertBefore(item, detectionLog.firstChild);
+                detectionLog.scrollTop = 0;
             }
-            
-            item.innerHTML = `
-                <div class="event-name">${detection.event}</div>
-                <div>Confidence: ${Math.round(detection.confidence * 100)}%</div>
-                <div class="confidence-bar">
-                    <div class="confidence-fill" style="width: ${detection.confidence * 100}%"></div>
-                </div>
-                <div class="timestamp">${timeString}</div>
-            `;
-            
-            detectionLog.insertBefore(item, detectionLog.firstChild);
-            
-            // Keep only the latest 50 detections
-            const items = detectionLog.getElementsByClassName('detection-item');
-            if (items.length > 50) {
-                detectionLog.removeChild(items[items.length - 1]);
-            }
-            
-            // Scroll to make sure the new entry is visible
-            detectionLog.scrollTop = 0;
-        }
-        
-        function showError(message) {
-            const item = document.createElement('div');
-            item.className = 'detection-item low-confidence';
-            item.innerHTML = `
-                <div class="event-name">Error</div>
-                <div>${message}</div>
-                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
-            `;
-            detectionLog.insertBefore(item, detectionLog.firstChild);
-        }
-        
-        function showMessage(message) {
-            const item = document.createElement('div');
-            item.className = 'detection-item';
-            item.innerHTML = `
-                <div class="event-name">System Message</div>
-                <div>${message}</div>
-                <div class="timestamp">${new Date().toLocaleTimeString()}</div>
-            `;
-            detectionLog.insertBefore(item, detectionLog.firstChild);
-        }
-    });
-</script>
+        });
+    </script>
 </body>
 </html>

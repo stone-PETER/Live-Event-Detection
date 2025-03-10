@@ -10,8 +10,22 @@ from tensorflow.keras.models import load_model
 import queue
 import atexit
 import signal
-from flask import Flask, jsonify, render_template, send_from_directory
+from flask import Flask, jsonify, render_template, send_from_directory, request
 from flask_socketio import SocketIO
+
+# Add these imports to the top of your detection.py
+import csv
+import requests
+import smtplib
+import os.path
+import uuid
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.audio import MIMEAudio
+import soundfile as sf
+from twilio.rest import Client
+from pydub import AudioSegment
+from datetime import datetime
 
 # Configuration
 MODEL_DIR = 'models'
@@ -31,9 +45,29 @@ COOLDOWN_PERIOD = 2.0  # Seconds between detections
 BACKGROUND_NOISE_SAMPLES = []  # To store background noise profiles
 CLASS_CONFUSION_MATRIX = {}  # Track which classes are confused with each other
 
+# Add these configuration variables
+# WhatsApp configuration (using Twilio)
+TWILIO_ACCOUNT_SID = "YOUR_TWILIO_ACCOUNT_SID"  # Replace with your Twilio Account SID
+TWILIO_AUTH_TOKEN = "YOUR_TWILIO_AUTH_TOKEN"  # Replace with your Twilio Auth Token
+TWILIO_PHONE_NUMBER = "YOUR_TWILIO_PHONE_NUMBER"  # Replace with your Twilio phone number
+
+# Email configuration
+GMAIL_ADDRESS = "b22ds056@mace.ac.in"  # Replace with your Gmail address
+GMAIL_APP_PASSWORD = "your-app-password"  # Replace with your Gmail App Password (not your regular Gmail password)
+
+# SMS configuration (using Twilio)
+SMS_FROM_NUMBER = "YOUR_TWILIO_PHONE_NUMBER"  # Same as TWILIO_PHONE_NUMBER usually
+
+# Notification settings
+NOTIFICATION_COOLDOWN = 300  # Seconds between notifications (5 minutes)
+THREAT_COUNT_THRESHOLD = 1  # Send notification after this many detections of the same threat
+EXCLUDED_EVENTS = ['env_audio']  # Events that don't trigger notifications
+NOTIFICATION_DIR = "notifications"  # Directory to store notification audio files
+os.makedirs(NOTIFICATION_DIR, exist_ok=True)
+
 # Initialize Flask app
 app = Flask(__name__, static_folder='.', static_url_path='')
-socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
+socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True, async_mode='threading')
 
 # Global variables
 audio_buffer = queue.Queue()
@@ -45,6 +79,11 @@ audio_stream = None  # Keep a reference to the audio stream
 recent_predictions = []
 class_thresholds = {}  # Will store custom thresholds for each class
 DEFAULT_THRESHOLD = 0.90  # Base threshold for all classes
+
+# Add this to your global variables
+threat_detection_counts = {}  # Track number of detections per threat
+last_notification_time = {}  # Track when last notification was sent for each threat
+contacts = []  # Will store contact information
 
 def load_trained_model():
     """Load the trained model and categories"""
@@ -246,6 +285,13 @@ def detect_events():
                                     'consistency': most_consistent_count,
                                     'timestamp': current_time
                                 })
+                                
+                                # Call threat detection handler
+                                handle_threat_detection(
+                                    event_name=event_name,
+                                    confidence=avg_confidence,
+                                    audio_data=audio_data.copy()  # Send a copy of the audio data
+                                )
                                 
                                 last_detection_time = current_time
                                 last_detected_class = most_consistent_class
@@ -535,6 +581,169 @@ def debug_emit(event, data):
     print(f"EMITTING {event}: {data}")
     socketio.emit(event, data)
 
+# Add this function
+def send_heartbeat():
+    """Send heartbeat to clients"""
+    while True:
+        socketio.sleep(5)
+        socketio.emit('heartbeat', {'time': time.time()})
+
+# Contact management
+def load_contacts():
+    """Load contacts from CSV file"""
+    contacts = []
+    try:
+        with open('contact.csv', 'r') as csv_file:
+            reader = csv.DictReader(csv_file)
+            for row in reader:
+                contacts.append({
+                    'name': row.get('NAME', ''),
+                    'email': row.get('EMAIL', ''),
+                    'phone': row.get('PHONE', '')
+                })
+        print(f"Loaded {len(contacts)} contacts")
+        return contacts
+    except Exception as e:
+        print(f"Error loading contacts: {e}")
+        return []
+
+# Notification functions
+def send_whatsapp_message(to_number, message):
+    """Send WhatsApp message using Twilio"""
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=message,
+            from_=f"whatsapp:{TWILIO_PHONE_NUMBER}",
+            to=f"whatsapp:{to_number}"
+        )
+        print(f"WhatsApp message sent to {to_number}: {message.sid}")
+        return True
+    except Exception as e:
+        print(f"Error sending WhatsApp message: {e}")
+        return False
+
+def send_email(to_email, subject, body, audio_file=None):
+    """Send email via Gmail"""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = GMAIL_ADDRESS
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Attach audio file if provided
+        if audio_file and os.path.exists(audio_file):
+            with open(audio_file, 'rb') as f:
+                audio_attachment = MIMEAudio(f.read(), _subtype="wav")
+                audio_attachment.add_header('Content-Disposition', 'attachment', filename=os.path.basename(audio_file))
+                msg.attach(audio_attachment)
+        
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        text = msg.as_string()
+        server.sendmail(GMAIL_ADDRESS, to_email, text)
+        server.quit()
+        
+        print(f"Email sent to {to_email}")
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        return False
+
+def send_sms(to_number, message):
+    """Send SMS using Twilio"""
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=message,
+            from_=SMS_FROM_NUMBER,
+            to=to_number
+        )
+        print(f"SMS sent to {to_number}: {message.sid}")
+        return True
+    except Exception as e:
+        print(f"Error sending SMS: {e}")
+        return False
+
+def save_audio_sample(audio_data, event_name):
+    """Save a portion of the audio data for notification attachments"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{NOTIFICATION_DIR}/threat_{event_name}_{timestamp}.wav"
+    
+    try:
+        # Save the audio data as a WAV file
+        sf.write(filename, audio_data, SAMPLE_RATE)
+        print(f"Audio sample saved to {filename}")
+        return filename
+    except Exception as e:
+        print(f"Error saving audio sample: {e}")
+        return None
+
+def handle_threat_detection(event_name, confidence, audio_data):
+    """Handle detection of a potential threat"""
+    global threat_detection_counts, last_notification_time, contacts
+    
+    # Skip if this is not a threat (in excluded events list)
+    if event_name.lower() in [e.lower() for e in EXCLUDED_EVENTS]:
+        return
+    
+    current_time = time.time()
+    
+    # Initialize counters if this is a new threat
+    if event_name not in threat_detection_counts:
+        threat_detection_counts[event_name] = 0
+        last_notification_time[event_name] = 0
+    
+    # Increment detection count
+    threat_detection_counts[event_name] += 1
+    
+    # Check if we should send notifications
+    if (threat_detection_counts[event_name] >= THREAT_COUNT_THRESHOLD and 
+            current_time - last_notification_time[event_name] > NOTIFICATION_COOLDOWN):
+        
+        print(f"ALERT: {event_name} detected {threat_detection_counts[event_name]} times! Sending notifications...")
+        
+        # Save audio sample
+        audio_file = save_audio_sample(audio_data, event_name)
+        
+        # Prepare notification message
+        notification_message = (
+            f"⚠️ ALERT: {event_name} detected!\n\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Confidence: {confidence:.2%}\n"
+            f"Location: Your home monitoring system"
+        )
+        
+        # Load contacts if not already loaded
+        if not contacts:
+            contacts = load_contacts()
+        
+        # Send notifications to all contacts
+        for contact in contacts:
+            # Send WhatsApp message
+            if contact['phone']:
+                send_whatsapp_message(contact['phone'], notification_message)
+                
+            # Send email
+            if contact['email']:
+                email_subject = f"⚠️ ALERT: {event_name} Detected"
+                send_email(contact['email'], email_subject, notification_message, audio_file)
+                
+            # Send SMS
+            if contact['phone']:
+                # SMS version is shorter due to length limitations
+                sms_message = f"ALERT: {event_name} detected at {datetime.now().strftime('%H:%M:%S')}. Check email for details."
+                send_sms(contact['phone'], sms_message)
+        
+        # Update the last notification time
+        last_notification_time[event_name] = current_time
+        
+        # Reset the counter
+        threat_detection_counts[event_name] = 0
+
 # Register cleanup handlers
 atexit.register(cleanup)
 signal.signal(signal.SIGINT, lambda sig, frame: cleanup())
@@ -576,11 +785,12 @@ def stop():
 @socketio.on('connect')
 def handle_connect():
     """Handle client connection"""
-    print('Client connected')
+    print('Client connected with ID:', request.sid)
     socketio.emit('status', {
         'model_loaded': model is not None,
-        'is_detecting': detection_thread is not None and detection_thread.is_alive()
-    })
+        'is_detecting': detection_thread is not None and detection_thread.is_alive(),
+        'connection_id': request.sid
+    }, to=request.sid)
 
 @socketio.on('client_test')
 def handle_client_test(data):
@@ -635,6 +845,10 @@ if __name__ == '__main__':
         
         # Analyze potential confusion in the model
         analyze_model_confusion()
+        
+        # Load contacts
+        contacts = load_contacts()  # Remove the global declaration here
+        print(f"Loaded {len(contacts)} contacts for notifications")
         
         # Start Flask server
         print("Starting server on http://127.0.0.1:2500")
